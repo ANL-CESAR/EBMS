@@ -1,0 +1,10 @@
+# 50M particles
+long npgk 50000
+
+int nb  128
+int r 16
+
+# 128 GB xdata
+long gsizemb  131072
+
+float tracking_rate 500

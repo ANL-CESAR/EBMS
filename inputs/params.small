@@ -1,0 +1,5 @@
+long npgk 10
+int nb  128
+int r 2
+long gsizemb 4
+float tracking_rate 5000
