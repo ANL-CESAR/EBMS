@@ -1,0 +1,41 @@
+This is a miniapp for the Energy Banding Monte Carlo (EBMC) neutron transportation
+simulation code.  It is adapted from a similar miniapp provided by Andrew Siegel,
+whose algorithm is described in [1], where only one process in a compute node
+is used, and the compute nodes are divided into memory nodes and tracking nodes.
+Memory nodes do not participate in particle tracking. Obviously, there is a lot
+of resource waste in this design.
+
+To improve problems stated above, we developed this miniapp with optimizations
+made possible by MPI-3.0. In this miniapp, there is no distinction between
+memory nodes and tracking nodes. All cores on all nodes are tracking particles.
+In the code, r nodes comprise a memory group, such that there are np/(r*ppn) memory
+groups in total. Here np is total number of processes and ppn is the number
+processes  per node. Cross section data  is distributed on r nodes per memory group.
+
+Within a compute node, we use MPI-3.0 shared memory windows to shared band data
+between MPI processes. Between compute nodes, we use non-blocking calls to fetch
+band data on remote nodes. With non-blocking calls, we can start fetching data for
+band k+1 when we begin to track particles in band k, in effect achieving computation
+and communication overlapping.
+
+We have two methods to fetch remote band data. In the first version of the
+miniapp (ebmc-iallgather), we use MPI_Iallgather, the nonblocking version of MPI_Allgather.
+In ebmc-iallgather, nodes of a memory group work in lockstep from the first band to
+the last band. Working in lockstep is a constraint. However, the benefit is that
+MPI runtimes have  global information of the communication pattern and might do
+ optimized communication scheduling.
+
+In the second version of the miniapp (ebmc-rget), we use MPI_Rget, a
+one-sided RMA operation newly defined by MPI-3.0. In ebmc-rget, nodes of a
+memory group work independently. The drawback is that the communication scheduling
+might be suboptimal.
+
+In our experiments on Blues of LCRC at ANL, ebmc-iallgather had the best
+performance, giving 15x speedup over the miniapp in [1].
+
+Questions: Please contact Junchao Zhang <jczhang@anl.gov>
+
+[1] Felker, Kyle G., Andrew R. Siegel, Kord S. Smith, Paul K. Romano, and Benoit Forget.
+"The energy band memory server algorithm for parallel Monte Carlo transport calculations."
+In SNA+ MC 2013-Joint International Conference on Supercomputing in Nuclear
+Applications+ Monte Carlo, p. 04207. EDP Sciences, 2014.

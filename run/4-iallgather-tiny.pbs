@@ -1,10 +1,10 @@
 #!/bin/sh
 #PBS -q route
-#PBS -N ebmc-small
+#PBS -N ebmc-iallgather-tiny
 #PBS -l nodes=2:ppn=2
 #PBS -l walltime=0:10:00
 #PBS -j oe
 
 cd $PBS_O_WORKDIR
-mpirun -n 4 ../ebmc ../inputs/params.small
+mpirun -n 4 ../ebmc-iallgather ../inputs/params.small
 exit 0

@@ -1,0 +1,10 @@
+#!/bin/sh
+#PBS -q route
+#PBS -N ebmc-iallgather-large
+#PBS -l nodes=64:ppn=16
+#PBS -l walltime=0:30:00
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+mpirun -n 1024 ../ebmc-iallgather ../inputs/params.large
+exit 0
