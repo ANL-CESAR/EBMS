@@ -30,3 +30,8 @@ float **matrix(long nrl, long nrh, long ncl, long nch){
   /* return pointer to array of pointers to rows */
   return m;
 }
+
+void matrix_free(float** m, long nrl, long nrh, long ncl, long nch) {
+    free(m[nrl]-NR_END);
+    free(m-NR_END);
+}

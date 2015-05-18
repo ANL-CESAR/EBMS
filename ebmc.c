@@ -1,14 +1,33 @@
-#include "matrix.h"
-#include "mpi.h"
-#include<stdio.h>
-#include<stdlib.h>
-#include<assert.h>
-#include<unistd.h>
-#include<signal.h>
+/*
+ Copyright (c) 2015 UChicago Argonne, LLC
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ THE SOFTWARE.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <signal.h>
 #include <string.h>
 #include <unistd.h>
-
-#define rn() (rand())/((double) RAND_MAX)
+#include <mpi.h>
+#include "matrix.h"
 
 #define MAX_FILENAME_CHARS = 128
 typedef enum boolean{
@@ -27,14 +46,12 @@ typedef struct proc{
     int type;
 } Proc;
 
-
 typedef struct Particle_type{
     int band;
     double energy;
     Boolean absorbed;
     int proc;
 } Particle;
-
 
 typedef struct {
     double val;
@@ -171,6 +188,7 @@ int main(int argc, char **argv)
     MPI_Request req2 = MPI_REQUEST_NULL;
     MPI_Request *reqcomm, *reqwork; // point to req1 or req2
     int flip = 1; // choosing between xscomm/xswork, reqcomm/reqwork
+    const float epsilon = 1.0e-8;
 
     Particle *p;              // local list of particles
     char     sm_file[128];    // path to file containing scattering matrix
@@ -193,11 +211,12 @@ int main(int argc, char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &my_global_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
+    srand48(100);
+
     // Creating a big data type so that the count argument in MPI_Send/Recv/Bcast
     // won't run out of range of an integer, i.e., 2GB
     MPI_Type_contiguous(1024, MPI_CHAR, &dtype_kbytes);
     MPI_Type_commit(&dtype_kbytes);
-
 
     // Rank 0 reads user input and then broadcast it
     fflush(stdout);
@@ -321,14 +340,16 @@ int main(int argc, char **argv)
     ////////////////////////////////////////////////////////////////////////////
     // For simplicity, assume a band can evenly distributed on cores in a shm.
     // buf1/2 are divided by processes in a shm to even out numa-effect.
-    MPI_Win shmwin1, shmwin2;
+    MPI_Win shmwin1, shmwin2, winwork;
     assert(bandsizekb*1024 % my_shm_size == 0);
-    MPI_Win_allocate_shared(bandsizekb*1024/my_shm_size, 1, MPI_INFO_NULL, shmcomm, &buf1, &shmwin1);
-    MPI_Win_allocate_shared(bandsizekb*1024/my_shm_size, 1, MPI_INFO_NULL, shmcomm, &buf2, &shmwin2);
+    rc = MPI_Win_allocate_shared(bandsizekb*1024/my_shm_size, 1, MPI_INFO_NULL, shmcomm, &buf1, &shmwin1); assert(!rc);
+    rc = MPI_Win_allocate_shared(bandsizekb*1024/my_shm_size, 1, MPI_INFO_NULL, shmcomm, &buf2, &shmwin2); assert(!rc);
 
     // Query the start address of the buf on rank 0 of shmcomm
-    MPI_Win_shared_query(shmwin1, 0, &size, &disp_unit, &buf1);
-    MPI_Win_shared_query(shmwin2, 0, &size, &disp_unit, &buf2);
+    rc = MPI_Win_shared_query(shmwin1, 0, &size, &disp_unit, &buf1); assert(!rc);
+    rc = MPI_Win_shared_query(shmwin2, 0, &size, &disp_unit, &buf2); assert(!rc);
+
+    if (!my_global_rank) printf("shmwin1 = %d, shmwin2 = %d\n", shmwin1, shmwin2);
 
     ////////////////////////////////////////////////////////////////////////////
     //
@@ -342,12 +363,19 @@ int main(int argc, char **argv)
     n_alive[0] = npl;
     for (int i=1; i<nb; ++i) n_alive[i] = 0;
 
-    global_total_alive = npg;
+    global_total_alive = npg; // assign a non-zero value
     my_total_alive = npl;
 
     ts = MPI_Wtime();
     int trips = 0;
     const double absorption_threshold = 1.0/nb;
+
+    // Open a passive target epoch on shared memory windows, since we will call
+    // MPI_Win_sync on them to sync shm members. Per MPI-3.0 p.449,
+    // "All flush and sync functions can be called only within passive target epochs."
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, shmwin1);
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, shmwin2);
+
     while (global_total_alive > 0) {
         trips++;
         // Start the pipepline by communicating band 0
@@ -356,7 +384,8 @@ int main(int argc, char **argv)
             char* sendbuf = (char*)xsdata;
             xscomm = buf1;
             reqcomm = &req1;
-            MPI_Iallgather(sendbuf, slicesizekb, dtype_kbytes, xscomm, slicesizekb, dtype_kbytes, dsmcomm, reqcomm);
+            rc = MPI_Iallgather(sendbuf, slicesizekb, dtype_kbytes, xscomm, slicesizekb, dtype_kbytes, dsmcomm, reqcomm);
+            assert(!rc);
         }
 
         // loop over bands starting with highest energy
@@ -371,35 +400,42 @@ int main(int argc, char **argv)
                 xscomm = flip ? buf2 : buf1;
                 reqcomm = flip ? &req2 : &req1;
                 char* sendbuf = (char*)xsdata + slicesizekb*1024*(k+1);
-                MPI_Iallgather(sendbuf, slicesizekb, dtype_kbytes, xscomm, slicesizekb, dtype_kbytes, dsmcomm, reqcomm);
+                rc = MPI_Iallgather(sendbuf, slicesizekb, dtype_kbytes, xscomm, slicesizekb, dtype_kbytes, dsmcomm, reqcomm);
+                assert(!rc);
             }
+
+            //if (!my_global_rank) printf("rank 0 is working on band %d\n", k);
 
             // Get xswork and then reverse
             reqwork = flip ? &req1 : &req2;
+            winwork = flip ? shmwin1 : shmwin2;
             xswork = flip ? buf1 : buf2;
             flip = !flip;
 
             // SHM members wait for their leader to complete nonblocking comm.
-            // Question: Can MPI_Barrier gurantee memory sync within SHM?
-            if (is_shm_leader) MPI_Wait(reqwork, MPI_STATUS_IGNORE);
+            if (is_shm_leader) {
+                MPI_Wait(reqwork, MPI_STATUS_IGNORE);
+                MPI_Win_sync(winwork); // Push stores to the window from private to public
+            }
             MPI_Barrier(shmcomm);
+            //    MPI_Win_sync(winwork); // Push stores to the window from private to public
+            if (!is_shm_leader) MPI_Win_sync(winwork); // Pull stores to the window from public to private
 
             assert(*(int*)xswork == k); // Make sure we are using correct cross sections
 
             if (n_alive[k] != 0) { // skip if no alive particles in band k
                 for (int i=0; i< npl; ++i) {
                     while (p[i].band == k && !p[i].absorbed) {
-                        ran_val = rn();
-                        //if (ran_val <= ABSORPTION_THRESHOLD) {
+                        ran_val = drand48();
                         if (ran_val <= absorption_threshold) {
                             usleep( (1.0/tracking_rate)*1000000 ); // sleep in microseconds
                             p[i].absorbed = TRUE;
                             --n_alive[k];
                         } else {
-                            ran_val = rn();
-                            int j = k;
+                            int j = 0;
+                            ran_val = drand48(); // ran_val is in [0.0, 1.0)
                             probability = scattering_matrix[k][j];
-                            while (ran_val > probability) {
+                            while (ran_val + epsilon > probability && j < nb) {
                                 ++j;
                                 probability = scattering_matrix[k][j];
                             }
@@ -413,9 +449,14 @@ int main(int argc, char **argv)
                 }
             }
         }
-        my_total_alive = tot(n_alive, nb);  // total alive across all bands after one sweep
+        my_total_alive = tot(n_alive, nb);  // total alive (on one process) across all bands after one sweep
+        // TODO: Do allreduce on all processes within dsmcomm instead of MPI_COMM_WORLD, since
+        // particle tracking of different dsmcomms is independant.
         MPI_Allreduce(&my_total_alive, &global_total_alive, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
     }
+    MPI_Win_unlock_all(shmwin1);
+    MPI_Win_unlock_all(shmwin2);
+
     tf = MPI_Wtime();
     ttot = tf - ts;
 
@@ -428,12 +469,12 @@ int main(int argc, char **argv)
 
     if (my_global_rank== 0){
         printf("nprocs = %d\n", nprocs);
-        printf("npg = %d million\n", (int)(npg/1000000.0));
-        printf("xsdata = %dGB\n", (int)(gsizekb/1048576.0));
+        printf("npg = %.1f million\n", npg/1000000.0);
+        printf("xsdata = %.1fGB\n", gsizekb/1048576.0);
         printf("energy bands per DSM(i.e., nb) = %d\n", nb);
         printf("energy bands per node = %d\n", nb/r);
         printf("nodes in a DSM (i.e., r) = %d\n", r);
-        printf("message size per ibcast = %d(MB)\n\n", (int)(bandsizekb/1024));
+        printf("message size per ibcast = %.1f(MB)\n\n", bandsizekb/1024.0);
 
         if (use_file)
             printf("scattering matrix file = %s\n", sm_file);
@@ -451,14 +492,17 @@ int main(int argc, char **argv)
     }
 
     free(n_alive);
+    free(ranges);
+    free(p);
     MPI_Comm_free(&shmcomm);
     if (is_shm_leader) {
         MPI_Comm_free(&shm_leader_comm);
         MPI_Comm_free(&dsmcomm);
+        free(xsdata);
     }
     MPI_Win_free(&shmwin1);
     MPI_Win_free(&shmwin2);
-    //TODO: also free scattering_matrix
+    matrix_free(scattering_matrix, 0, nb-1, 0, nb-1);
     MPI_Type_free(&dtype_kbytes);
     MPI_Finalize();
     return 0;
